@@ -94,6 +94,21 @@ const Util = {
     return h ? `${h}:${Util.pad(m)}:${Util.pad(sec)}` : `${Util.pad(m)}:${Util.pad(sec)}`;
   },
 
+  /** "2 phút 15 giây", "45 giây", "1 giờ 3 phút" */
+  formatCallDuration(ms) {
+    const s = Math.max(0, Math.round(ms / 1000));
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    if (h) {
+      return `${h} giờ${m ? ` ${m} phút` : ''}`;
+    }
+    if (m) {
+      return `${m} phút${sec ? ` ${sec} giây` : ''}`;
+    }
+    return `${sec} giây`;
+  },
+
   formatSize(bytes) {
     if (!bytes && bytes !== 0) {
       return '';

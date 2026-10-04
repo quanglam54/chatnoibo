@@ -257,12 +257,27 @@ const App = {
     }
   },
 
-  callLabel(body) {
+  /** Nội dung tin nhắn cuộc gọi: { video, caller, status: 'ended'|'missed', duration (ms) } */
+  callInfo(m) {
     try {
-      return JSON.parse(body).video ? 'Cuộc gọi video' : 'Cuộc gọi thoại';
+      return JSON.parse(m.body) || {};
     } catch (e) {
-      return 'Cuộc gọi';
+      return {};
     }
+  },
+
+  /** Tin nhắn cuộc gọi hiển thị về phía người gọi (người ghi lại có thể là người rời cuối) */
+  msgOwner(m) {
+    return (m.kind === 'call' && App.callInfo(m).caller) || m.sender_id;
+  },
+
+  callLabel(body) {
+    const call = App.callInfo({ body });
+    if (call.status === 'missed') {
+      return call.caller === App.me ? 'Cuộc gọi đi không ai trả lời' : 'Cuộc gọi nhỡ';
+    }
+    const label = call.video ? 'Cuộc gọi video' : 'Cuộc gọi thoại';
+    return call.duration ? `${label} · ${Util.formatCallDuration(call.duration)}` : label;
   },
 
   /* ================= Realtime ================= */
@@ -877,12 +892,12 @@ const App = {
     }
 
     const groupable = (a, b) =>
-      a && b && a.kind !== 'system' && b.kind !== 'system' && a.sender_id === b.sender_id &&
+      a && b && a.kind !== 'system' && b.kind !== 'system' && App.msgOwner(a) === App.msgOwner(b) &&
       new Date(b.created_at) - new Date(a.created_at) < 5 * 60000;
 
     let lastMineIdx = -1;
     list.forEach((m, i) => {
-      if (m.sender_id === App.me && m.kind !== 'system') {
+      if (App.msgOwner(m) === App.me && m.kind !== 'system') {
         lastMineIdx = i;
       }
     });
@@ -902,15 +917,16 @@ const App = {
       const sepAfter = next && (!Util.isSameDay(m.created_at, next.created_at) || new Date(next.created_at) - new Date(m.created_at) > 30 * 60000);
       const hasPrev = !sepBefore && groupable(prev, m);
       const hasNext = !sepAfter && groupable(m, next);
-      const mine = m.sender_id === App.me;
+      const owner = App.msgOwner(m);
+      const mine = owner === App.me;
       const pos = !hasPrev ? 'first' : hasNext ? 'mid' : 'last';
       const showAvatar = !mine && !hasNext;
       const showName = !mine && conv.is_group && !hasPrev;
 
       parts.push(`<div class="msg-row ${mine ? 'mine' : ''} ${pos} ${hasNext ? 'has-next' : ''}" data-id="${m.id}">
-        ${mine ? '' : `<div class="avatar-slot">${showAvatar ? Util.avatarHtml(App.profile(m.sender_id), 'sm') : ''}</div>`}
+        ${mine ? '' : `<div class="avatar-slot">${showAvatar ? Util.avatarHtml(App.profile(owner), 'sm') : ''}</div>`}
         <div class="msg-col">
-          ${showName ? `<div class="sender-name">${Util.escapeHtml(App.profile(m.sender_id).display_name)}</div>` : ''}
+          ${showName ? `<div class="sender-name">${Util.escapeHtml(App.profile(owner).display_name)}</div>` : ''}
           ${App.messageBodyHtml(m)}
         </div>
       </div>`);
@@ -950,15 +966,15 @@ const App = {
       </a></div>`;
     }
     if (m.kind === 'call') {
-      let video = false;
-      try {
-        video = JSON.parse(m.body).video;
-      } catch (e) {
-        video = false;
-      }
-      return `<div class="bubble" title="${time}"><div class="call-card">
-        <span class="call-icon"><svg><use href="#${video ? 'i-video' : 'i-phone'}"/></svg></span>
-        <span><div class="call-label">${video ? 'Cuộc gọi video' : 'Cuộc gọi thoại'}</div><div class="call-time">${time}</div></span>
+      const call = App.callInfo(m);
+      const missed = call.status === 'missed';
+      const label = missed
+        ? call.caller === App.me ? 'Không ai trả lời' : 'Cuộc gọi nhỡ'
+        : call.video ? 'Cuộc gọi video' : 'Cuộc gọi thoại';
+      const sub = call.duration ? Util.formatCallDuration(call.duration) : time;
+      return `<div class="bubble" title="${time}"><div class="call-card ${missed ? 'missed' : ''}">
+        <span class="call-icon"><svg><use href="#${call.video ? 'i-video' : 'i-phone'}"/></svg></span>
+        <span><div class="call-label">${label}</div><div class="call-time">${sub}</div></span>
       </div></div>`;
     }
     const emoji = Util.isEmojiOnly(m.body) ? 'emoji-only' : '';
@@ -1011,7 +1027,7 @@ const App = {
     if (!row || !conv || !store) {
       return;
     }
-    const mine = store.list.filter((m) => m.sender_id === App.me && m.kind !== 'system');
+    const mine = store.list.filter((m) => App.msgOwner(m) === App.me && m.kind !== 'system');
     const last = mine[mine.length - 1];
     if (!last) {
       row.innerHTML = '';

@@ -65,6 +65,9 @@ const Call = {
     if (info.convId) {
       c.convId = info.convId;
     }
+    if (info.caller) {
+      c.caller = info.caller;
+    }
     c.lastSeen = Date.now();
     if (mode === 'set') {
       c.participants = new Set(participants);
@@ -136,6 +139,13 @@ const Call = {
   async onSignal(p) {
     const s = Call.state;
     const inThisCall = s && s.id === p.callId;
+    if (inThisCall && p.type !== 'leave') {
+      s.gone.delete(p.from);
+      const sender = s.peers.get(p.from);
+      if (sender) {
+        sender.lastSeen = Date.now();
+      }
+    }
 
     switch (p.type) {
       case 'invite': {
@@ -170,7 +180,13 @@ const Call = {
       case 'alive':
         Call.trackCall(p, p.participants || [p.from], 'set');
         if (inThisCall) {
-          (p.participants || []).forEach((id) => id !== App.me && Call.ensurePeer(id));
+          if (p.startedAt && (!s.callStartedAt || p.startedAt < s.callStartedAt)) {
+            s.callStartedAt = p.startedAt;
+          }
+          if (p.caller) {
+            s.callerId = p.caller;
+          }
+          (p.participants || []).forEach((id) => id !== App.me && (id === p.from || !s.gone.has(id)) && Call.ensurePeer(id));
         }
         return;
       case 'offer':
@@ -194,7 +210,7 @@ const Call = {
         if (inThisCall) {
           Call.removePeer(p.from);
           if (!s.isGroup) {
-            Call.end('Cuộc gọi đã kết thúc');
+            Call.end();
           } else if (s.hadPeers && !s.peers.size) {
             Call.end('Mọi người đã rời cuộc gọi');
           }
@@ -259,10 +275,10 @@ const Call = {
     Call.state = Call.newState({ id: Util.uuid(), convId, isGroup: conv.is_group, video, members, outgoing: true, media });
     Call.showCallUi();
     Sound.startRingback();
-    Call.send({ type: 'invite', convId, video, isGroup: conv.is_group, to: conv.member_ids });
+    Call.state.callerId = App.me;
+    Call.send({ type: 'invite', convId, video, isGroup: conv.is_group, caller: App.me, to: conv.member_ids });
     Call.trackCall(Call.state.info(), [App.me], 'add');
     Call.startAlive();
-    App.insertMessage({ conversation_id: convId, kind: 'call', body: JSON.stringify({ callId: Call.state.id, video }) });
 
     const callId = Call.state.id;
     Call.state.ringTimer = setTimeout(() => {
@@ -287,6 +303,7 @@ const Call = {
       outgoing: false,
       media,
     });
+    Call.state.callerId = active.caller || null;
     Call.showCallUi();
     Call.send({ type: 'join', to: conv.member_ids });
     Call.trackCall(Call.state.info(), [App.me], 'add');
@@ -355,6 +372,7 @@ const Call = {
     }
     Call.dismissIncoming();
     const active = Call.activeCalls.get(inc.callId) || { callId: inc.callId, convId: inc.convId, video: inc.video, isGroup: inc.isGroup };
+    active.caller = active.caller || inc.from;
     await Call.joinExisting(active, video);
     if (App.activeId !== inc.convId && window.innerWidth > 760) {
       App.openConversation(inc.convId);
@@ -372,7 +390,7 @@ const Call = {
       Util.toast('Mọi người đều đã ở trong cuộc gọi');
       return;
     }
-    Call.send({ type: 'invite', convId: s.convId, video: s.video, isGroup: s.isGroup, to: missing });
+    Call.send({ type: 'invite', convId: s.convId, video: s.video, isGroup: s.isGroup, caller: s.callerId || App.me, to: missing });
     Util.toast(`Đã đổ chuông cho ${missing.length} người`);
   },
 
@@ -391,8 +409,11 @@ const Call = {
       micOn: !!media.micTrack,
       facing: 'user',
       startedAt: null,
+      callStartedAt: null,
+      callerId: null,
       hadPeers: false,
       focusId: null,
+      gone: new Set(),
       info() {
         return { callId: this.id, convId: this.convId, video: this.video, isGroup: this.isGroup };
       },
@@ -586,6 +607,8 @@ const Call = {
       remoteMic: true,
       remoteScreen: false,
       restarts: 0,
+      lastSeen: Date.now(),
+      badSince: null,
       connected: false,
       tile: null,
     };
@@ -711,15 +734,23 @@ const Call = {
     if (st === 'connected') {
       peer.connected = true;
       peer.restarts = 0;
+      peer.badSince = null;
       s.hadPeers = true;
       clearTimeout(s.ringTimer);
       Sound.stopLoop();
       if (!s.startedAt) {
         s.startedAt = Date.now();
+        s.callStartedAt = s.callStartedAt || s.startedAt;
         s.timer = setInterval(() => Call.renderStatus(), 1000);
       }
       Call.applyBitrates();
-    } else if (st === 'failed') {
+    } else if (st === 'closed') {
+      Call.dropPeer(peer.uid);
+      return;
+    } else if (st === 'disconnected' || st === 'failed') {
+      peer.badSince = peer.badSince || Date.now();
+    }
+    if (st === 'failed') {
       if (App.me < peer.uid && peer.restarts < 3) {
         peer.restarts++;
         Call.makeOffer(peer, true);
@@ -769,15 +800,58 @@ const Call = {
     Call.applyBitrates();
   },
 
+  /** Bỏ một người khỏi cuộc gọi khi họ mất tín hiệu (đóng app, rớt mạng mà không kịp báo `leave`) */
+  dropPeer(uid) {
+    const s = Call.state;
+    if (!s || !s.peers.has(uid)) {
+      return;
+    }
+    s.gone.add(uid);
+    Call.removePeer(uid);
+    Call.trackCall(s.info(), [uid], 'remove');
+    if (s.hadPeers && !s.peers.size) {
+      Call.end(s.isGroup ? 'Mọi người đã rời cuộc gọi' : '');
+    }
+  },
+
+  /** Phát hiện người đã biến mất: không có tín hiệu 12s hoặc mất kết nối 10s */
+  checkPeers() {
+    const s = Call.state;
+    const now = Date.now();
+    for (const peer of Array.from(s.peers.values())) {
+      const silent = now - peer.lastSeen > 12000;
+      const broken = peer.badSince && now - peer.badSince > 10000;
+      if (silent || broken) {
+        Call.dropPeer(peer.uid);
+        if (!Call.state) {
+          return;
+        }
+      }
+    }
+  },
+
   startAlive() {
     const tick = () => {
       const s = Call.state;
       if (!s) {
         return;
       }
+      Call.checkPeers();
+      if (Call.state !== s) {
+        return;
+      }
       const participants = [App.me, ...Array.from(s.peers.keys())];
-      Call.send({ type: 'alive', convId: s.convId, video: s.video, isGroup: s.isGroup, participants, to: s.members });
-      Call.trackCall(s.info(), participants, 'set');
+      Call.send({
+        type: 'alive',
+        convId: s.convId,
+        video: s.video,
+        isGroup: s.isGroup,
+        caller: s.callerId,
+        startedAt: s.callStartedAt,
+        participants,
+        to: s.members,
+      });
+      Call.trackCall({ ...s.info(), caller: s.callerId }, participants, 'set');
     };
     tick();
     Call.state.aliveTimer = setInterval(tick, ALIVE_INTERVAL);
@@ -793,7 +867,29 @@ const Call = {
     if (!s) {
       return;
     }
-    Call.sendToMembers({ type: 'leave' });
+    // Gửi `leave` 2 lần cho chắc (tín hiệu realtime có thể rơi)
+    const leave = { type: 'leave', callId: s.id, to: s.members };
+    Call.send(leave);
+    setTimeout(() => App.signal(leave), 600);
+
+    // Người cuối cùng rời cuộc gọi ghi lại cuộc gọi vào đoạn chat
+    const duration = s.callStartedAt && s.hadPeers ? Date.now() - s.callStartedAt : 0;
+    if (!s.peers.size) {
+      App.insertMessage({
+        conversation_id: s.convId,
+        kind: 'call',
+        body: JSON.stringify({
+          callId: s.id,
+          video: !!s.video,
+          caller: s.callerId || App.me,
+          status: s.hadPeers ? 'ended' : 'missed',
+          duration,
+        }),
+      });
+    }
+    if (s.hadPeers) {
+      reason = `${reason || 'Cuộc gọi đã kết thúc'} · ${Util.formatCallDuration(duration)}`;
+    }
     clearTimeout(s.ringTimer);
     clearInterval(s.timer);
     clearInterval(s.aliveTimer);
